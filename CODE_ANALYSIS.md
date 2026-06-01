@@ -62,7 +62,7 @@ Outlook threadé = 2 appels : `createReply` (brouillon vide) puis `patch` (rempl
 **Correctif :** valider `to`/`cc`/`bcc` générés par l'IA contre une politique d'autorisation (contacts connus / même domaine / validation utilisateur) avant FORWARD/SEND.
 
 ### 1.6 `noMatchFound` ignoré dans le chemin multi-règles → no-op silencieux
-`MEDIUM` · **confirmé**
+`MEDIUM` · **confirmé** · ⏭️ **SKIP (downgrade)** — relecture du code : les deux branches retournent `rules: []` (même résultat sûr qu'un vrai no-match) et `noMatchFound` n'est pas exposé à l'appelant ; aucun observateur downstream ni catch-all n'en dépend → impact réel nul. Un retry serait du sur-engineering (philosophie AI-first).
 `apps/web/utils/ai/choose-rule/ai-choose-rule.ts:59-83, 219`
 Quand le modèle renvoie `noMatchFound: false` avec un `ruleName` inexistant, le `.find()` écarte le nom inconnu → `rules: []` alors que `noMatchFound` est faux : l'email reste non traité, sans retry. Défait l'attente d'une règle « catch-all ».
 **Correctif :** si `noMatchFound` est faux mais qu'aucun nom candidat ne résout, traiter explicitement comme no-match (ou retenter une fois).
@@ -138,7 +138,7 @@ Aucun mutex par compte. L'écriture est protégée par concurrence optimistique 
 **Correctif :** `jobId` déterministe (id du run) ; dead-letter queue ou alerte sur échec permanent.
 
 ### 2.6 Comparaisons de secrets non constant-time (clé interne, cron)
-`LOW` · **confirmé**
+`LOW` · **confirmé** · ✅ **CORRIGÉ** (TDD, PR #2764) — helper partagé `secureCompare` (`timingSafeEqual` gardé en longueur) utilisé pour la clé API interne et les deux checks cron (header + body). Aucun changement de comportement.
 `apps/web/utils/internal-api.ts:59` (`apiKey === env.INTERNAL_API_KEY`) ; `utils/cron.ts` (`=== Bearer ${CRON_SECRET}`, et `body.CRON_SECRET === …`). Contraste avec Slack/Lemon Squeezy qui utilisent `crypto.timingSafeEqual`. Side-channel temporel surtout théorique, mais l'incohérence est la preuve.
 **Correctif :** `crypto.timingSafeEqual` (avec garde de longueur) partout.
 
@@ -172,12 +172,12 @@ Aucun mutex par compte. L'écriture est protégée par concurrence optimistique 
 **Correctif :** `beforeSend`/`beforeSendTransaction` dans les deux configs, scrubbing via la même logique que `hashSensitiveFields` ; supprimer les bodies request/response des `APICallError` ; baisser `tracesSampleRate` en prod. (Le replay client a déjà `maskAllText: true`.)
 
 ### 4.2 `subject` d'email loggé en niveau `info`
-`MEDIUM` · **confirmé** (vérifié manuellement)
+`MEDIUM` · **confirmé** (vérifié manuellement) · ✅ **CORRIGÉ** (PR #2765) — le log « Skipping message… » passe en `logger.trace()` (politique : PII en trace).
 `apps/web/app/api/outlook/webhook/process-history.ts:108-114` — `from`/`to` sont hashés en prod, mais `subject` n'est dans **aucun** set de redaction (`utils/logger.ts:193-211` : `SENSITIVE_FIELD_NAMES`, `CONTENT_FIELD_NAMES`, `REDACTED_FIELD_NAMES`). Le sujet brut est écrit en logs à chaque message Outlook ignoré.
 **Correctif :** `logger.trace()`, ou ajouter `subject`/`snippet` à `CONTENT_FIELD_NAMES`.
 
 ### 4.3 Vérification webhook Telegram/Teams déléguée au SDK, non vérifiée dans le repo
-`MEDIUM` · **suspecté** — *aussi sécurité*
+`MEDIUM` · **suspecté** — *aussi sécurité* · 🔎 **VÉRIFIÉ — DÉJÀ GÉRÉ** (pas de fix nécessaire) — `@chat-adapter/telegram.handleWebhook` compare le header `X-Telegram-Bot-Api-Secret-Token` au `secretToken` configuré (`adapters.ts:68`) via `timingSafeEqual` → 401 sinon ; Teams délègue la validation du JWT Bot Framework au SDK officiel `@microsoft/teams.apps`. Seul résiduel : si `TELEGRAM_BOT_SECRET_TOKEN` n'est pas défini, la vérification Telegram est désactivée (warning explicite) — point de configuration, pas de bug.
 `apps/web/app/api/telegram/events/route.ts`, `teams/events/route.ts` → `utils/messaging/chat-sdk/webhook-route.ts:38-54`
 Contrairement à Slack (signature `x-slack-signature` vérifiée dans ce repo), aucune vérification du `X-Telegram-Bot-Api-Secret-Token` ni du JWT Bot Framework Teams n'existe dans le code applicatif (grep négatif). Elle vit (ou non) dans le package SDK.
 **Impact :** si le SDK ne valide pas le secret token Telegram / le JWT Teams, des mises à jour forgées seraient traitées comme légitimes.
@@ -190,7 +190,7 @@ Les deux ne gardent que sur un secret global partagé ; le compte cible vient de
 **Note connexe :** `app/api/google/webhook/route.ts` — `if (verificationToken !== "" && …)` : un token vide **désactive** la vérification (repose sur une passerelle OIDC amont). Hors passerelle, le webhook devient non authentifié → *fail closed* recommandé.
 
 ### 4.5 `id_token` Google stocké en clair au repos
-`LOW` · **confirmé** (vérifié manuellement)
+`LOW` · **confirmé** (vérifié manuellement) · ✅ **CORRIGÉ** (PR #2765) — `id_token` ajouté à `ENCRYPTED_FIELDS.account`. Sans migration (le read laisse passer le plaintext existant, chiffre à la prochaine écriture) ; `id_token` jamais requêté par valeur.
 `apps/web/utils/prisma-extensions.ts:16` (`account: ["access_token", "refresh_token"]`) vs `prisma/schema.prisma:28` (`id_token String? @db.Text`, écrit par le callback de linking). Le JWT `id_token` (email, name, sub) est persisté en clair, contrairement aux tokens frères. Redacté en logs, donc « at-rest only » ; signé/court.
 **Correctif :** ajouter `id_token` à `ENCRYPTED_FIELDS.account` + backfill.
 
@@ -217,14 +217,14 @@ Les deux ne gardent que sur un secret global partagé ; le compte cible vient de
 
 > Objectif : ne pas retravailler ce qui est déjà en cours. Croisement des findings ci-dessus avec les 63 PR ouvertes sur `elie222/inbox-zero`, **au niveau fichier** (un fichier touché par une PR n'implique pas que la même région/le même bug soit corrigé — vérifier au merge).
 >
-> **Légende :** ✅ corrigé · 🟡 partiel / thème adjacent · ⬜ aucune PR — **libre de travailler**.
+> **Légende :** ✅ corrigé (ce repo) · 🟡 partiel / thème adjacent · 🔎 vérifié — déjà géré · ⏭️ skip (bénin/intentionnel) · ⏸️ déféré (décision/refactor) · ⬜ aucune PR.
 
 | Finding | Sév. | Statut | PR |
 |---|---|---|---|
-| §1.1 regex non ancrée — `match-rules.ts` | HIGH | ✅ **corrigé** (ce repo, TDD) | — |
-| §1.2 `getThreadsBatch` erreurs avalées — `gmail/thread.ts` | HIGH | ✅ **corrigé** (ce repo, TDD) | — |
-| §2.1 injection prompt délimiteurs — `stringify-email.ts` | HIGH | ✅ **corrigé** (ce repo, TDD) | — |
-| §4.1 Sentry sans `beforeSend` — `instrumentation*.ts` | HIGH | ✅ **corrigé** (ce repo, TDD ; résiduel message-string noté) | — |
+| §1.1 regex non ancrée — `match-rules.ts` | HIGH | ✅ **corrigé** (ce repo, TDD) | #2758 |
+| §1.2 `getThreadsBatch` erreurs avalées — `gmail/thread.ts` | HIGH | ✅ **corrigé** (ce repo, TDD) | #2760 |
+| §2.1 injection prompt délimiteurs — `stringify-email.ts` | HIGH | ✅ **corrigé** (ce repo, TDD) | #2757 |
+| §4.1 Sentry sans `beforeSend` — `instrumentation*.ts` | HIGH | ✅ **corrigé** (ce repo, TDD ; résiduel message-string noté) | #2762 |
 | §1.8 action planifiée échouée — `scheduled-actions/executor.ts` | MED | 🟡 **partiel** : #2752 corrige le cycle `ExecutedRule` (APPLYING bloqué / APPLIED erroné) mais **n'ajoute pas** de retry pour les erreurs transitoires (le cœur de §1.8 reste) | #2752 |
 | §2.2 clé interne scopée par le body — `qstash.ts` + routes | HIGH | 🟡 **partiel** : #2519 scope **une** route (digest) par compte ; pattern général non traité | #2519 |
 | §1.3 idempotence actions immédiates — `run-rules.ts`/`execute.ts` | HIGH(susp.) | 🟡 #2010 modifie `execute.ts` (feature draft-review, régions ≠) ; pattern atomique appliqué ailleurs (#2521) ; **fix non fait** | #2010 |
@@ -232,21 +232,21 @@ Les deux ne gardent que sur un secret global partagé ; le compte cible vient de
 | §1.5 `forward` sans validation destinataire — `ai/actions.ts` | MED | 🟡 #2010 modifie `actions.ts` (action `draft`, **pas** `forward`) ; fix non fait | #2010 |
 | §2.4 refresh token sans single-flight — `gmail/outlook client.ts` | MED | 🟡 thème proche : #2533/#2534 traitent le refresh/reauth **calendrier** Outlook (`calendar-client.ts`), pas le refresh email | #2533, #2534 |
 | §3.1 N+1 `getThread` — `email/google.ts` | MED | 🟡 fichier touché ailleurs ; fix non fait | #2733, #2672 |
-| §4.2 `subject` loggué `info` — `outlook/webhook/process-history.ts` | MED | ⬜ **libre** sur ce fichier (mais le **thème** logs-PII est traité ailleurs par #2517) | — |
-| §1.6 `noMatchFound` — `ai-choose-rule.ts` | MED | ⬜ **libre** | — |
-| §1.7 double-enqueue Vercel — `queue/dispatch.ts` | MED | ⬜ **libre** | — |
-| §1.9 `saveUsage` avale erreurs — `redis/usage.ts` | MED | ⬜ **libre** | — |
-| §2.3 rate-limit asym Gmail/Outlook | MED | ⬜ **libre** | — |
-| §2.5 BullMQ `jobId`/dead-letter — `queue/bullmq.ts` | MED | ⬜ **libre** | — |
-| §2.6 comparaisons non constant-time — `internal-api.ts`/`cron.ts` | LOW | ⬜ **libre** | — |
-| §3.3 hash `usage:*` sans TTL — `redis/usage.ts` | LOW | ⬜ **libre** | — |
-| §4.3 webhook Telegram/Teams non vérifié | MED(susp.) | ⬜ **libre** | — |
-| §4.4 push forgé compte arbitraire | MED | ⬜ **libre** | — |
-| §4.5 `id_token` non chiffré — `prisma-extensions.ts` | LOW | ⬜ **libre** | — |
+| §4.2 `subject` loggué `info` — `outlook/webhook/process-history.ts` | MED | ✅ **corrigé** (ce repo, log → `trace`) | #2765 |
+| §1.6 `noMatchFound` — `ai-choose-rule.ts` | MED | ⏭️ **skip** (downgrade) : résultat identique et sûr (`rules: []`), `noMatchFound` non exposé downstream → pas de bug réel | — |
+| §1.7 double-enqueue Vercel — `queue/dispatch.ts` | MED | ⏸️ **déféré** : fall-through = résilience volontaire ; double-run déjà neutralisé par le claim atomique `PENDING→RUNNING` → décision mainteneur | — |
+| §1.9 `saveUsage` avale erreurs — `redis/usage.ts` | MED | ⏸️ **déféré** : décision produit (best-effort vs fail-closed sur le plafonnement de coût) | — |
+| §2.3 rate-limit asym Gmail/Outlook | MED | ⏸️ **déféré** : refactor plus lourd (`emailAccountId` → `OutlookProvider` + wrapper symétrique) | — |
+| §2.5 BullMQ `jobId`/dead-letter — `queue/bullmq.ts` | MED | ⏸️ **déféré** : helper générique sans id naturel (hasher le body fusionnerait des jobs légitimes) ; dead-letter = infra | — |
+| §2.6 comparaisons non constant-time — `internal-api.ts`/`cron.ts` | LOW | ✅ **corrigé** (ce repo, TDD ; helper `secureCompare`) | #2764 |
+| §3.3 hash `usage:*` sans TTL — `redis/usage.ts` | LOW | ⏭️ **skip** : intentionnel (usage à vie) | — |
+| §4.3 webhook Telegram/Teams non vérifié | MED(susp.) | 🔎 **vérifié — déjà géré** : Telegram (`@chat-adapter/telegram`, secret-token `timingSafeEqual` → 401), Teams (SDK `@microsoft/teams.apps`, JWT). Config-dépendant pour Telegram | — |
+| §4.4 push forgé compte arbitraire | MED | ⏭️ **intentionnel** : token vide = affordance pour passerelle OIDC amont (documenté en code) | — |
+| §4.5 `id_token` non chiffré — `prisma-extensions.ts` | LOW | ✅ **corrigé** (ce repo ; ajout à `ENCRYPTED_FIELDS`, sans migration) | #2765 |
 
 **Contexte campagne `bugfix-batch-0139`** (#2517, #2518, #2519, #2521, #2525, #2533, #2534) : série de PR générées par un agent Cursor en arrière-plan, ciblant exactement les *classes* de bugs de cet audit (claims atomiques anti-doublon, scoping par compte, assainissement des logs PII, races d'autorisation type dernier-owner). Elles touchent surtout les **digests**, le **calendrier Outlook** et l'**org** — pas les fichiers de mes findings HIGH. À surveiller : un prochain lot de cette campagne pourrait empiéter sur les findings 🟡/⬜ ; idéalement, alimenter mes findings dans ce même processus de batch.
 
-**Net :** les 4 findings **HIGH** (§1.1, §1.2, §2.1, §4.1) et la majorité des MED/LOW sont **libres**. Seul §1.8 est directement (partiellement) adressé par #2752. Bonus : #2525 corrige une race de suppression du dernier owner d'org que mon audit n'avait pas relevée (l'autorisation y était jugée saine — la race TOCTOU lui a échappé).
+**Net (état au 2026-06-01) :** les 4 findings **HIGH** sont corrigés et soumis en PR (#2757 §2.1, #2758 §1.1, #2760 §1.2, #2762 §4.1). Côté MED/LOW : **§2.6, §4.2, §4.5 corrigés** (#2764, #2765) ; **§4.3 vérifié — déjà géré** par les SDK ; **§1.6, §3.3, §4.4** écartés (bénins/intentionnels) ; **§1.7, §1.9, §2.3, §2.5 déférés** (décisions de conception protégées par des filets existants, ou refactors). Les findings 🟡 (§1.3, §1.4, §1.5, §2.2, §2.4, §3.1, §1.8) restent partiellement adressés par la campagne `bugfix-batch-0139` — à vérifier au merge. Bonus : #2525 corrige une race de suppression du dernier owner d'org que mon audit n'avait pas relevée (l'autorisation y était jugée saine — la race TOCTOU lui a échappé).
 
 ---
 
