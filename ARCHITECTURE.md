@@ -1,176 +1,133 @@
 # Inbox Zero Architecture
 
-The initial version of this document was created by Google Gemini 2.0 Flash Thinking Experimental 01-21.
+This document gives the big-picture architecture of the repository. For build/test/lint commands and code conventions, see `AGENTS.md`. For a Claude-Code-focused orientation, see `CLAUDE.md`.
 
-The Inbox Zero repository is structured as a monorepo, consisting of the main web application (`apps/web`), supporting deployable apps, and shared packages.
+Inbox Zero is a Turborepo + pnpm monorepo: a main Next.js web app (`apps/web`) holding nearly all business logic, a background job worker, image proxies, and shared packages.
 
 ```txt
 ├── apps/
-│ ├── web/ // Main Next.js web application (frontend and backend)
-│ ├── worker/ // Background worker process
-│ ├── image-proxy/ // Cloudflare Worker image proxy
+│ ├── web/             // Main Next.js (App Router) app — frontend, API routes, server actions, Prisma, AI logic
+│ ├── worker/          // BullMQ worker that drains Redis queues and forwards jobs to the web app
+│ ├── image-proxy/     // Cloudflare Worker image proxy
 │ └── image-proxy-aws/ // AWS image proxy
-├── packages/ // Reusable libraries and configurations
-│ ├── api/
-│ ├── cli/
-│ ├── image-proxy/
-│ ├── loops/
-│ ├── resend/
-│ ├── scheduling/
-│ ├── tinybird/
-│ ├── tinybird-ai-analytics/
-│ └── tsconfig/
-├── charts/ // Helm chart for Kubernetes deployments
-├── docker/ // Docker configurations and deployment scripts
-├── docs/ // Public documentation site
-├── qa/ // Browser QA flow definitions
-└── ... // Other configuration and documentation files
+├── packages/          // Reusable libraries and configurations
+│ ├── api/             // CLI for the external/public API
+│ ├── cli/             // Self-hosting / setup CLI
+│ ├── image-proxy/     // Shared image-proxy utilities
+│ ├── loops/           // Loops marketing-email integration
+│ ├── resend/          // Resend transactional-email integration
+│ ├── scheduling/      // Shared scheduling helpers
+│ ├── tinybird/        // Tinybird real-time analytics
+│ ├── tinybird-ai-analytics/ // Tinybird AI-usage analytics
+│ └── tsconfig/        // Shared TypeScript configs
+├── charts/            // Helm chart for Kubernetes deployments
+├── docker/            // Dockerfiles and Compose for local/prod deployment
+├── docs/              // Public documentation site
+├── qa/                // Browser QA flow definitions
+└── ...
 ```
 
-### 1. `apps/web` - Main Web Application
+## 1. `apps/web` — Main Web Application
 
-- **Framework:** Next.js (App Router)
-- **Purpose:** The primary user-facing application. Handles frontend rendering, user authentication, API routes for backend logic, and integration with external services.
-- **Key Directories:**
-  - `app/`: Next.js App Router structure, containing frontend components, pages, layouts, and API routes.
-  - `components/`: React components, including UI elements and feature-specific components.
-  - `utils/actions/`: Next.js Server Actions for data mutations and backend logic.
-  - `styles/`: Global CSS and styling configurations (Tailwind CSS).
-  - `providers/`: React Context providers for state management and service integration.
-  - `store/`: Jotai atoms for application-wide state management and queue handling.
-  - `prisma/`: Database schema and migrations.
-- **Key Functionalities:**
-  - User interface for all features (AI assistant, unsubscriber, analytics, settings).
-  - User authentication and session management (Better Auth).
-  - API endpoints for interacting with Gmail, Outlook, AI models, and other services.
-  - Server-side rendering and data fetching.
-  - Integration with payment processing (Stripe, Lemon Squeezy, Apple IAP) and analytics/logging (Tinybird, PostHog, Axiom).
+- **Framework:** Next.js (App Router).
+- **Auth:** Better Auth (`utils/auth.ts`), with support for email accounts across multiple providers and a mobile/Expo client.
+- **Purpose:** All user-facing UI plus the backend — API routes, server actions, the AI engine, and provider integrations.
 
-### 2. `packages` - Reusable Packages
+Key directories:
 
-- **Purpose:** Contains reusable libraries, configurations, and utilities shared by the web app.
-- **Key Packages:**
-  - `api`: CLI wrapper for the public API.
-  - `cli`: Self-hosting and deployment CLI.
-  - `image-proxy`: Shared image proxy utilities.
-  - `loops`: Related to marketing email automation.
-  - `resend`: Integration with Resend for transactional email sending.
-  - `scheduling`: Shared scheduling helpers.
-  - `tinybird`: Integration with Tinybird for real-time analytics.
-  - `tinybird-ai-analytics`: Integration with Tinybird for AI usage analytics.
-  - `tsconfig`: Shared TypeScript configurations.
+- `app/` — App Router. Route groups: `(app)` (authenticated product), `(landing)`, `(marketing)`, `(redirects)`. API routes under `app/api/`.
+- `components/` — reusable React components shared across pages (shadcn/ui + Radix + Tailwind).
+- `providers/` — React context providers (auth/email-account context, SWR, chat, compose modal, PostHog, etc.).
+- `store/` — **client-side** Jotai atoms and UI-level work queues (see §4).
+- `utils/` — the bulk of backend logic and shared helpers, including the AI engine and the provider abstractions (see §3, §5).
+- `prisma/` — PostgreSQL schema and migrations.
 
-### 3. `apps/web/prisma` - Database Layer
+### Multi-account routing
 
-- **Purpose:** Manages the PostgreSQL database schema and migrations.
-- **Key Files:**
-  - `schema.prisma`: Defines the database schema using Prisma Schema Language.
-  - `migrations/`: Contains database migration files for schema updates.
+A user can connect several email accounts. Authenticated product routes are namespaced per account under `app/(app)/[emailAccountId]/...` (assistant, automation, reply-zero, bulk-unsubscribe, cold-email-blocker, briefs, drive, calendars, smart-categories, stats, settings, integrations, …).
 
-### 4. `apps/web/store` - State Management and Queues
+API middleware tiers: `withError` (public, no auth), `withAuth` (user-level), `withEmailAccount` (scoped to a single email account). Mutations use server actions (`next-safe-action`); GET API routes are for data fetching, consumed via SWR on the client.
 
-- **Purpose:** Implements client-side state management using Jotai and defines queues for background task processing.
-- **Key Files:**
-  - `index.ts`: Jotai store initialization.
-  - `ai-queue.ts`: Queue for AI-related tasks.
-  - `archive-queue.ts`: Queue for email archiving tasks.
-  - `archive-sender-queue.ts`: Queue for bulk sender archiving.
-  - `ai-categorize-sender-queue.ts`: Queue for AI-based sender categorization.
+## 2. `apps/worker` — Background Jobs
 
-### 5. `apps/web/utils` - Utilities and Core Logic
+A lightweight BullMQ worker (`apps/worker/src/runtime.mjs`) connected to Redis. It listens on queues — `automation-jobs`, `digest-item-summarize`, `email-summary-all`, `email-digest-all` — and for each job forwards an authenticated HTTP request (internal API key) to the corresponding `apps/web/app/api/...` route. This keeps heavy/long-running work (rule automation, digests, summaries) off the request path while letting the actual logic live in the web app. Self-hosted deployments without the worker can drive the same endpoints via cron.
 
-- **Purpose:** Houses utility functions, shared logic, and server actions.
-- **Key Directories:**
-  - `actions/`: Next.js Server Actions for various features (admin, ai-rule, api-key, auth, categorize, cold-email, group, mail, premium, rule, unsubscriber, user, webhook, whitelist).
-  - `ai/`: AI-related logic, including rule choosing, argument generation, prompt engineering, and integration with LLM providers.
-  - `gmail/`: Gmail API client and utility functions for interacting with Gmail (mail, threads, labels, filters, etc.).
-  - `queue/`: Queue management utilities.
-  - `redis/`: Redis integration and utilities for caching and data storage.
-  - `rule/`: Rule-related utilities (prompt file parsing, rule fixing, etc.).
-  - `scripts/`: Scripts for database migrations, data manipulation, and other maintenance tasks.
+> Note: this server-side queue system (BullMQ + Redis) is distinct from the client-side Jotai queues in `apps/web/store` (§4), which only sequence UI actions in the browser.
 
-### 6. `docker` - Docker Configuration
+## 3. Provider Abstraction (core cross-cutting pattern)
 
-- **Purpose:** Contains Dockerfile for containerizing the web application.
-- **Key Files:**
-  - `Dockerfile.web`: Dockerfile for building the Next.js web application image.
-  - `docker-compose.yml`: Docker Compose file for setting up local development environment with PostgreSQL, Redis, and the web application.
+The product is multi-provider (Gmail + Outlook, and more). Integrations go through a factory → interface pattern so feature code stays provider-agnostic:
+
+- **Email:** `createEmailProvider({ emailAccountId, provider })` in `utils/email/provider.ts` returns an `EmailProvider` (`GmailProvider` | `OutlookProvider`). Feature code targets the `EmailProvider` interface, never a raw Gmail/Microsoft Graph client.
+- The same pattern is used for `utils/calendar/`, `utils/drive/` (Google Drive / OneDrive attachment filing), `utils/messaging/providers/` (Slack, Telegram), and `utils/llms/` (model providers).
+
+Rule of thumb (also in `AGENTS.md`): prefer the `EmailProvider` abstraction; only use provider-type checks (`isGoogleProvider`, `isMicrosoftProvider`) at true provider boundary / integration code.
+
+## 4. `apps/web/store` — Client State & UI Queues
+
+Client-side state management with Jotai. Includes UI work queues that sequence browser-initiated batch actions (e.g. `archive-queue`, `archive-sender-queue`, `mark-read-sender-queue`, `ai-queue`, `ai-categorize-sender-queue`, `sender-queue`). These run in the browser and call server actions / API routes; they are not the background-job system (§2).
+
+## 5. `apps/web/utils/ai` — AI Engine
+
+All AI logic lives here, split by feature: `choose-rule` (rule matching), `reply`, `digest`, `meeting-briefs`, `document-filing`, `categorize-sender`, `clean`, `knowledge`, `mcp`, `assistant`, `group`, `report`, `snippets`, `calendar`, `automation-jobs`. LLM provider wiring lives in `utils/llms/`. See `.claude/skills/llm/SKILL.md` and `.claude/skills/llm-test/SKILL.md` before changing prompts or LLM behavior, and back prompt changes with evals.
+
+## 6. `apps/web/prisma` — Database Layer
+
+PostgreSQL via Prisma. `schema.prisma` defines the schema; `migrations/` holds migration history. (Do not use dynamic Prisma transactions — see `AGENTS.md`.)
 
 ## API Endpoints
 
-The application exposes the following API endpoints under `apps/web/app/api/`:
+Under `apps/web/app/api/`. Notable groups:
 
-- `/api/ai/*`: AI-related endpoints (categorization, summarization, autocomplete, models).
-- `/api/auth/*`: Authentication endpoints (Better Auth).
-- `/api/google/*`: Gmail API proxy endpoints (messages, threads, labels, drafts, contacts, webhook, watch).
-- `/api/lemon-squeezy/*`: Lemon Squeezy webhook and API integration endpoints.
-- `/api/resend/*`: Resend API integration endpoints (email sending, summary emails, all emails).
-- `/api/user/*`: User-specific data and actions endpoints (planned rules, history, settings, categories, groups, cold emails, bulk archive, usage, me).
-- `/api/v1/*`: Versioned API endpoints for external integrations (rules, stats, OpenAPI documentation).
+- `/api/ai/*` — AI features (categorization, summaries, autocomplete, models).
+- `/api/auth/*` — Better Auth; `/api/mobile-auth/*`, `/api/sso/*` for mobile and SSO.
+- `/api/google/*`, `/api/outlook/*` — provider API proxies and OAuth.
+- `/api/watch/*`, `/api/email/*`, `/api/email-stream/*` — webhook/watch registration and inbound email handling.
+- `/api/automation-jobs/*`, `/api/scheduled-actions/*`, `/api/cron/*`, `/api/follow-up-reminders/*` — background-job and scheduled-work endpoints (driven by the worker or cron).
+- `/api/digest-preview/*`, `/api/meeting-briefs/*`, `/api/knowledge/*`, `/api/clean/*` — feature endpoints.
+- `/api/slack/*`, `/api/telegram/*`, `/api/teams/*` — chat/messaging integrations.
+- `/api/stripe/*`, `/api/lemon-squeezy/*`, `/api/apple/*` — payment/subscription webhooks (Stripe, Lemon Squeezy, Apple IAP).
+- `/api/resend/*` — transactional/summary emails.
+- `/api/chat/*`, `/api/chats/*`, `/api/mcp/*` — assistant chat and MCP.
+- `/api/user/*`, `/api/organizations/*`, `/api/admin/*`, `/api/health` — user/org/admin/health.
+- `/api/v1/*` — versioned public API for external integrations.
 
 ## Key Data Flows
 
-1.  **Email Processing and AI Automation:**
+1. **Email processing & AI automation:**
+   - A Gmail/Outlook webhook fires; the provider webhook handler fetches the email via the active `EmailProvider`.
+   - `utils/ai/choose-rule` matches the email against the account's database rules.
+   - The matching rule's actions run through the `EmailProvider` (archive, label, draft reply, file attachment, etc.), with AI-generated arguments where needed.
+   - Executed rules/actions are persisted (Prisma), enabling per-rule analytics. Heavy steps are queued to the worker (§2).
 
-    - Gmail or Outlook webhooks receive email notifications.
-    - Provider webhook handlers fetch email details from Gmail or Microsoft Graph.
-    - Email data is passed to AI rule engine (`utils/ai/choose-rule`) to find matching rules.
-    - Matching rules are executed, potentially involving AI-generated actions (`utils/ai/actions`).
-    - Actions (archive, label, reply, etc.) are performed through the active email provider.
-    - Executed rules and actions are stored in the database (Prisma).
+2. **Bulk Unsubscriber:** the UI lists newsletters/senders (sourced from Tinybird analytics); the user selects targets; unsubscribe/archive run via server actions + provider integrations; status is persisted.
 
-2.  **Bulk Unsubscriber:**
+3. **Email Analytics:** Tinybird data sources/pipes collect activity; `app/(app)/[emailAccountId]/stats` reads from the Tinybird API and renders charts.
 
-    - User initiates bulk unsubscribe process from the web UI (`apps/web/app/(app)/bulk-unsubscribe`).
-    - Frontend fetches list of newsletters and senders from Tinybird analytics data (`packages/tinybird`).
-    - User selects newsletters to unsubscribe from.
-    - Unsubscribe actions are handled inside the web application server actions and provider integrations.
-    - Unsubscribe status is updated in the database.
-
-3.  **Email Analytics:**
-    - Tinybird data sources and pipes (`packages/tinybird`) collect email activity data.
-    - Web UI (`apps/web/app/(app)/stats`) fetches analytics data from Tinybird API and displays charts and summaries.
+4. **Digests & Meeting Briefs:** scheduled jobs (worker queues / cron) summarize email into digests and assemble pre-meeting briefs from email + calendar context.
 
 ## Environment Variables
 
-The project extensively uses environment variables for configuration. These variables configure:
+Configuration is env-driven (add new vars to `.env.example`, `env.ts`, and `turbo.json`; prefix client vars with `NEXT_PUBLIC_`). Covers: LLM/API keys (OpenAI, Anthropic, Google AI, Bedrock, Groq, Ollama), OAuth credentials (Google, Microsoft), Postgres + Redis URLs, Pub/Sub topic and verification token, payment providers (Stripe, Lemon Squeezy, Apple IAP), analytics/logging (Tinybird, PostHog, Axiom, Sentry), email (Resend, Loops), feature flags, admin emails, and internal webhook/API keys.
 
-- API keys for OpenAI, Google AI, Anthropic, Bedrock, Groq, Ollama, Tinybird, Lemon Squeezy, Resend, PostHog, Axiom, Crisp.
-- OAuth client IDs and secrets for Google authentication.
-- Database connection URLs (PostgreSQL, Upstash Redis).
-- Google Cloud Pub/Sub topic name and verification token.
-- Sentry DSN for error tracking.
-- Feature flags (PostHog).
-- License keys and payment links (Lemon Squeezy).
-- Admin email addresses.
-- Webhook URLs and API keys for internal communication.
-
-## Features
+## Feature Design Notes
 
 ### AI Personal Assistant
 
-The user can set a prompt file which gets converted to individual rules in our database.
-What is ultimately passed to the LLM is the database rules and not the prompt file.
-We have a two way sync system between the db rules and the prompt file. This is messy, and maybe it would be better to just have one-way data flow via the prompt file.
+The user sets a prompt file which gets converted to individual rules in our database. What is ultimately passed to the LLM is the database rules, not the prompt file. We maintain a two-way sync between the DB rules and the prompt file. This is messy; a one-way data flow from the prompt file might be cleaner.
 
-The benefit to having database rules:
+Benefits of database rules:
 
-- In most cases, the AI is only deciding if conditions are matched.
-- We have specific entries for each rule, so we can track how often each is called. If it were fully prompt based this wouldn't be possible. This is a potentially minor benefit to the user however.
-- Because actions are static (unless using templates), the user can precisely define how the actions work without any LLM interference.
+- In most cases the AI only decides whether conditions match.
+- Each rule is a distinct entry, so we can track how often each is called — impossible with a fully prompt-based approach.
+- Actions are static (unless using templates), so the user can precisely define behavior without LLM interference.
 
-The current structure of the AI personal assistant is due to the product evolving. Had it been designed from scratch it would likely have been structured a little differently to avoid the two-way sync issues. This architecture may be changed in the future.
-
-Another downside of not using the prompt file as the source of truth for the LLM is that some information included in the prompt file will not be passed to the LLM. Not something the user expects. For example, the user might write style guidelines at the top of the prompt file, but there's no natural way for this to be moved into the rules, as this information applies to all rules. We do have an `about` section that can be used for this on the `Settings` page, but this is separate.
+The current structure reflects how the product evolved; a from-scratch design would likely avoid the two-way sync. One downside: information in the prompt file that isn't a rule (e.g. global style guidelines at the top) doesn't naturally reach the LLM — the `about` section on Settings exists for this but is separate.
 
 ### Reply Tracking
 
-This feature is built off of the AI personal assistant.
-There's a special type of rule for reply tracking.
-I considered making it a separate feature similar to the cold email blocker. It makes things a little messy having this special type of rule, but the benefit is it integrates with the existing assistant and all the features built around that now.
-This means each user has their own reply tracking prompt (but this is also annoying, because it makes it hard for us to do a global update for all users for the prompt, which is something we can do for the cold email blocker prompt).
+Built on top of the AI personal assistant via a special rule type. Keeping it as a rule type (rather than a standalone feature like the cold-email blocker) is slightly messy but integrates with the existing assistant and everything built around it. Consequence: each user has their own reply-tracking prompt, which makes global prompt updates harder than for the cold-email blocker.
 
-### Cold email blocker
+### Cold Email Blocker
 
-The cold email blocker monitors for incoming emails, if the user has never sent us an email before we run it through an LLM to decide if it's a cold email or not.
-This feature is not connected to the AI personal assistant.
+Monitors incoming email; if the sender has never received email from the user, it runs the message through an LLM to decide whether it's a cold email. This feature is independent of the AI personal assistant.
