@@ -79,7 +79,7 @@ Toute erreur d'exécution passe l'action à `FAILED` définitif, même pour un 5
 **Correctif :** distinguer transitoire/permanent ; laisser PENDING (ou état RETRY) pour le transitoire.
 
 ### 1.9 `saveUsage` avale toutes les erreurs → sous-comptage usage/coût
-`MEDIUM` · **confirmé**
+`MEDIUM` · **confirmé** · ✅ **CORRIGÉ** (TDD, PR #2767) — séquencement `hincrbyfloat`→`expire` du `weeklyCostKey` (TTL garantie, corrige une course) + `Promise.allSettled` pour ne plus masquer les échecs partiels. Politique **best-effort conservée** (pas de fail-closed).
 `apps/web/utils/redis/usage.ts` (`saveUsage`) — `Promise.all([...incréments...]).catch(log)`. Les `hincrby` sont atomiques par champ (pas de race), mais un rejet partiel est avalé : certains incréments passent, d'autres non. Si une limite de coût AI est appliquée sur ces compteurs, le sous-comptage la contourne sous Redis dégradé.
 **Correctif :** si les compteurs servent à plafonner, échouer fermé (fail-closed) ou retenter.
 
@@ -235,7 +235,7 @@ Les deux ne gardent que sur un secret global partagé ; le compte cible vient de
 | §4.2 `subject` loggué `info` — `outlook/webhook/process-history.ts` | MED | ✅ **corrigé** (ce repo, log → `trace`) | #2765 |
 | §1.6 `noMatchFound` — `ai-choose-rule.ts` | MED | ⏭️ **skip** (downgrade) : résultat identique et sûr (`rules: []`), `noMatchFound` non exposé downstream → pas de bug réel | — |
 | §1.7 double-enqueue Vercel — `queue/dispatch.ts` | MED | ⏸️ **déféré** : fall-through = résilience volontaire ; double-run déjà neutralisé par le claim atomique `PENDING→RUNNING` → décision mainteneur | — |
-| §1.9 `saveUsage` avale erreurs — `redis/usage.ts` | MED | ⏸️ **déféré** : décision produit (best-effort vs fail-closed sur le plafonnement de coût) | — |
+| §1.9 `saveUsage` TTL/échecs — `redis/usage.ts` | MED | ✅ **corrigé** (ce repo, TDD ; TTL séquencée + `allSettled`, best-effort conservé) | #2767 |
 | §2.3 rate-limit asym Gmail/Outlook | MED | ⏸️ **déféré** : refactor plus lourd (`emailAccountId` → `OutlookProvider` + wrapper symétrique) | — |
 | §2.5 BullMQ `jobId`/dead-letter — `queue/bullmq.ts` | MED | ⏸️ **déféré** : helper générique sans id naturel (hasher le body fusionnerait des jobs légitimes) ; dead-letter = infra | — |
 | §2.6 comparaisons non constant-time — `internal-api.ts`/`cron.ts` | LOW | ✅ **corrigé** (ce repo, TDD ; helper `secureCompare`) | #2764 |
@@ -246,7 +246,7 @@ Les deux ne gardent que sur un secret global partagé ; le compte cible vient de
 
 **Contexte campagne `bugfix-batch-0139`** (#2517, #2518, #2519, #2521, #2525, #2533, #2534) : série de PR générées par un agent Cursor en arrière-plan, ciblant exactement les *classes* de bugs de cet audit (claims atomiques anti-doublon, scoping par compte, assainissement des logs PII, races d'autorisation type dernier-owner). Elles touchent surtout les **digests**, le **calendrier Outlook** et l'**org** — pas les fichiers de mes findings HIGH. À surveiller : un prochain lot de cette campagne pourrait empiéter sur les findings 🟡/⬜ ; idéalement, alimenter mes findings dans ce même processus de batch.
 
-**Net (état au 2026-06-01) :** les 4 findings **HIGH** sont corrigés et soumis en PR (#2757 §2.1, #2758 §1.1, #2760 §1.2, #2762 §4.1). Côté MED/LOW : **§2.6, §4.2, §4.5 corrigés** (#2764, #2765) ; **§4.3 vérifié — déjà géré** par les SDK ; **§1.6, §3.3, §4.4** écartés (bénins/intentionnels) ; **§1.7, §1.9, §2.3, §2.5 déférés** (décisions de conception protégées par des filets existants, ou refactors). Les findings 🟡 (§1.3, §1.4, §1.5, §2.2, §2.4, §3.1, §1.8) restent partiellement adressés par la campagne `bugfix-batch-0139` — à vérifier au merge. Bonus : #2525 corrige une race de suppression du dernier owner d'org que mon audit n'avait pas relevée (l'autorisation y était jugée saine — la race TOCTOU lui a échappé).
+**Net (état au 2026-06-01) :** les 4 findings **HIGH** sont corrigés et soumis en PR (#2757 §2.1, #2758 §1.1, #2760 §1.2, #2762 §4.1). Côté MED/LOW : **§2.6, §4.2, §4.5, §1.9 corrigés** (#2764, #2765, #2767) ; **§4.3 vérifié — déjà géré** par les SDK ; **§1.6, §3.3, §4.4** écartés (bénins/intentionnels) ; **§1.7, §2.3, §2.5 déférés** (décisions de conception protégées par des filets existants, ou refactors à faible ROI). Les findings 🟡 (§1.3, §1.4, §1.5, §2.2, §2.4, §3.1, §1.8) restent partiellement adressés par la campagne `bugfix-batch-0139` — à vérifier au merge. Bonus : #2525 corrige une race de suppression du dernier owner d'org que mon audit n'avait pas relevée (l'autorisation y était jugée saine — la race TOCTOU lui a échappé).
 
 ---
 
